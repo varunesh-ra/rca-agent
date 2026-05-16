@@ -1,7 +1,7 @@
 import json
 import logging
 from datetime import datetime, timezone
-from .db import execute, execute_one
+from .db import execute, execute_one, json_loads
 
 logger = logging.getLogger(__name__)
 
@@ -19,16 +19,19 @@ def read_cache(service_name: str, cache_key: str) -> dict | None:
         "UPDATE service_context_cache SET last_used_at = NOW() WHERE service_name = %s AND cache_key = %s",
         (service_name, cache_key)
     )
-    return row["content"]
+    return json_loads(row["content"])
 
 
 def write_cache(service_name: str, cache_key: str, content: dict, commit_sha: str | None = None) -> None:
     execute(
         """INSERT INTO service_context_cache (service_name, cache_key, content, commit_sha)
            VALUES (%s, %s, %s, %s)
-           ON CONFLICT (service_name, cache_key) DO UPDATE
-           SET content = EXCLUDED.content, commit_sha = EXCLUDED.commit_sha,
-               created_at = NOW(), last_used_at = NOW(), invalidated_at = NULL""",
+           ON DUPLICATE KEY UPDATE
+               content = VALUES(content),
+               commit_sha = VALUES(commit_sha),
+               created_at = NOW(),
+               last_used_at = NOW(),
+               invalidated_at = NULL""",
         (service_name, cache_key, json.dumps(content), commit_sha)
     )
     logger.debug("Cache WRITE: %s / %s", service_name, cache_key)
@@ -40,7 +43,7 @@ def invalidate_service_cache(service_name: str, new_commit_sha: str) -> None:
         """UPDATE service_context_cache
            SET invalidated_at = NOW()
            WHERE service_name = %s
-             AND cache_key LIKE 'file:%%' OR cache_key = 'repo_tree'
+             AND (cache_key LIKE 'file:%%' OR cache_key = 'repo_tree')
              AND (commit_sha IS NULL OR commit_sha != %s)""",
         (service_name, new_commit_sha)
     )

@@ -21,14 +21,17 @@
         </encoder>
     </appender>
 
-    <!-- File appender – mount /var/log in Docker and point Datadog agent here -->
+    <!-- File appender — writes to Docker shared volume at /var/log/banking-app/app.log -->
+    <!-- Uses plain text so the error-ingestion-agent log_parser.py can read it -->
     <appender name="FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
-        <file>logs/banking-app.log</file>
+        <file>/var/log/banking-app/app.log</file>
         <rollingPolicy class="ch.qos.logback.core.rolling.TimeBasedRollingPolicy">
-            <fileNamePattern>logs/banking-app.%d{yyyy-MM-dd}.log</fileNamePattern>
+            <fileNamePattern>/var/log/banking-app/app.%d{yyyy-MM-dd}.log</fileNamePattern>
             <maxHistory>7</maxHistory>
         </rollingPolicy>
-        <encoder class="net.logstash.logback.encoder.LogstashEncoder"/>
+        <encoder>
+            <pattern>%d{yyyy-MM-dd HH:mm:ss} %-5level %logger{36} - %msg%n%ex</pattern>
+        </encoder>
     </appender>
 
     <root level="INFO">

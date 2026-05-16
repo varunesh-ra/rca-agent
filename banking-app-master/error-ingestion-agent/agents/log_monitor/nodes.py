@@ -109,7 +109,7 @@ CATEGORY: <category>"""
 
     try:
         llm = ChatGoogleGenerativeAI(
-            model="gemini-1.5-flash",
+            model="gemini-2.5-flash",
             google_api_key=settings.gemini_api_key,
             temperature=0.1,
         )
@@ -146,7 +146,7 @@ async def store_node(state: IncidentState) -> IncidentState:
     """
     Persist the parsed + analyzed incident to the unified error_incidents table.
     """
-    logger.info("store_node: writing incident to PostgreSQL")
+    logger.info("store_node: writing incident to MySQL")
 
     try:
         incident_id = await insert_incident(
@@ -160,7 +160,7 @@ async def store_node(state: IncidentState) -> IncidentState:
             source=state.get("source", "db_watcher"),
             occurred_at=state.get("timestamp"),
         )
-        logger.info("store_node: incident #%d stored successfully", incident_id)
+        logger.info("store_node: incident %s stored successfully", incident_id)
         return {
             **state,
             "incident_id": incident_id,

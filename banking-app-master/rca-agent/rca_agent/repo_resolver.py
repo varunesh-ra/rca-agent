@@ -86,7 +86,9 @@ class RepoResolver:
     def _write_mapping(self, service_name: str, org: str, repo: str) -> None:
         execute(
             """INSERT INTO service_repo_map (service_name, github_org, github_repo)
-               VALUES (%s, %s, %s) ON CONFLICT (service_name) DO UPDATE
-               SET github_org = EXCLUDED.github_org, github_repo = EXCLUDED.github_repo""",
+               VALUES (%s, %s, %s)
+               ON DUPLICATE KEY UPDATE
+                   github_org = VALUES(github_org),
+                   github_repo = VALUES(github_repo)""",
             (service_name, org, repo),
         )

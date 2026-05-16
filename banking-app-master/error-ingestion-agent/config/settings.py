@@ -7,8 +7,8 @@ from typing import Literal
 
 
 class Settings(BaseSettings):
-    # PostgreSQL (unified rca_db)
-    database_url: str = "postgresql://postgres:postgres@localhost:5432/rca_db"
+    # MySQL (unified rca_db)
+    database_url: str = "mysql+pymysql://root:root@localhost:3306/rca_db"
 
     # Google Gemini
     gemini_api_key: str = ""

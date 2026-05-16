@@ -1,36 +1,63 @@
 """
-Error Ingestion Agent — PostgreSQL Database Layer
-Connects to the unified rca_db and writes to the error_incidents table.
+Error Ingestion Agent — MySQL Database Layer
+Connects to the unified rca_db and writes directly to error_logs
+(the same table the RCA agent reads from).
+Uses aiomysql for async MySQL access.
 """
+import json
 import logging
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Optional
+from urllib.parse import urlparse
 
-import asyncpg
+import aiomysql
 
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
-_pool: Optional[asyncpg.Pool] = None
+_pool: Optional[aiomysql.Pool] = None
 
 
-async def get_pool() -> asyncpg.Pool:
-    """Return (or create) the shared connection pool."""
+def _parse_dsn(database_url: str) -> dict:
+    """Parse a mysql:// or mysql+pymysql:// DSN into aiomysql kwargs."""
+    url = (
+        database_url
+        .replace("mysql+pymysql://", "mysql://")
+        .replace("mysql+aiomysql://", "mysql://")
+        .replace("mysql+mysqldb://", "mysql://")
+    )
+    parsed = urlparse(url)
+    return {
+        "host": parsed.hostname or "localhost",
+        "port": parsed.port or 3306,
+        "user": parsed.username or "root",
+        "password": parsed.password or "",
+        "db": parsed.path.lstrip("/"),
+        "charset": "utf8mb4",
+        "autocommit": False,
+    }
+
+
+async def get_pool() -> aiomysql.Pool:
     global _pool
     if _pool is None:
-        # asyncpg uses postgresql:// DSN directly
-        dsn = settings.database_url.replace("postgresql+asyncpg://", "postgresql://")
-        _pool = await asyncpg.create_pool(dsn, min_size=1, max_size=5)
-        logger.info("PostgreSQL connection pool created — %s", dsn.split("@")[-1])
+        kwargs = _parse_dsn(settings.database_url)
+        _pool = await aiomysql.create_pool(minsize=1, maxsize=5, **kwargs)
+        logger.info(
+            "MySQL connection pool created — %s:%s/%s",
+            kwargs["host"], kwargs["port"], kwargs["db"],
+        )
     return _pool
 
 
 async def close_pool() -> None:
     global _pool
     if _pool:
-        await _pool.close()
+        _pool.close()
+        await _pool.wait_closed()
         _pool = None
 
 
@@ -42,32 +69,17 @@ async def get_connection():
 
 
 async def ensure_table() -> None:
-    """Create error_incidents table if it doesn't exist (idempotent)."""
+    """Verify error_logs table exists (created by rca-agent alembic migrations)."""
     async with get_connection() as conn:
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS error_incidents (
-                id              SERIAL PRIMARY KEY,
-                service_name    VARCHAR(255) NOT NULL,
-                environment     VARCHAR(100) NOT NULL DEFAULT 'production',
-                error_type      VARCHAR(500),
-                message         TEXT NOT NULL,
-                severity        VARCHAR(50)  DEFAULT 'ERROR',
-                stack_trace     TEXT,
-                raw_log         TEXT,
-                occurred_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                source          VARCHAR(50)  NOT NULL DEFAULT 'db_watcher'
-                                CHECK (source IN ('db_watcher', 'datadog_webhook')),
-                rca_status      VARCHAR(50)  NOT NULL DEFAULT 'pending'
-                                CHECK (rca_status IN ('pending', 'in_progress', 'completed', 'failed')),
-                rca_result      TEXT,
-                created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )
-        """)
-        await conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_error_incidents_lookup
-                ON error_incidents (service_name, rca_status, created_at DESC)
-        """)
-        logger.info("error_incidents table ready")
+        async with conn.cursor() as cur:
+            await cur.execute("SHOW TABLES LIKE 'error_logs'")
+            if not await cur.fetchone():
+                logger.warning(
+                    "error_logs table not found — make sure rca-agent ran "
+                    "'alembic upgrade head' before this service started"
+                )
+            else:
+                logger.info("error_logs table ready")
 
 
 async def insert_incident(
@@ -80,45 +92,47 @@ async def insert_incident(
     raw_log: str,
     source: str,
     occurred_at: Optional[datetime] = None,
-) -> int:
+) -> str:
     """
-    Insert a new error incident and return its id.
-
-    Args:
-        service_name:  Name of the originating service (e.g. 'banking-app')
-        environment:   Deployment environment (e.g. 'production')
-        error_type:    Exception class or error category
-        message:       Human-readable error description
-        severity:      Log level string: ERROR, WARN, INFO, etc.
-        stack_trace:   Extracted stack trace (None if unavailable)
-        raw_log:       Full raw log entry text
-        source:        'db_watcher' or 'datadog_webhook'
-        occurred_at:   When the error occurred (defaults to NOW())
-
-    Returns:
-        The new incident's id (int)
+    Insert a new error into error_logs (the unified table read by the RCA agent).
+    Returns the new row's UUID string.
     """
+    row_id = str(uuid.uuid4())
+
+    # stack_trace column is JSON in error_logs — wrap plain text into a list
+    stack_trace_json: list = []
+    if stack_trace:
+        # Try to split into individual frame lines for readability
+        frames = [line.strip() for line in stack_trace.splitlines() if line.strip()]
+        stack_trace_json = [{"text": f} for f in frames] if frames else [{"text": stack_trace}]
+
+    metadata = {"source": source, "raw_log": raw_log[:2000]}
+
     async with get_connection() as conn:
-        incident_id = await conn.fetchval(
-            """
-            INSERT INTO error_incidents
-                (service_name, environment, error_type, message, severity,
-                 stack_trace, raw_log, source, occurred_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-            RETURNING id
-            """,
-            service_name,
-            environment,
-            error_type,
-            message,
-            severity,
-            stack_trace,
-            raw_log,
-            source,
-            occurred_at or datetime.utcnow(),
-        )
-        logger.info(
-            "Incident #%d inserted — service=%s severity=%s source=%s",
-            incident_id, service_name, severity, source,
-        )
-        return incident_id
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                INSERT INTO error_logs
+                    (id, service_name, environment, error_type, error_message,
+                     stack_trace, severity, occurred_at, metadata, rca_status)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'pending')
+                """,
+                (
+                    row_id,
+                    service_name,
+                    environment,
+                    error_type or "UnknownError",
+                    message,
+                    json.dumps(stack_trace_json),
+                    severity,
+                    occurred_at or datetime.utcnow(),
+                    json.dumps(metadata),
+                ),
+            )
+        await conn.commit()
+
+    logger.info(
+        "Incident #%s inserted — service=%s severity=%s source=%s",
+        row_id[:8], service_name, severity, source,
+    )
+    return row_id

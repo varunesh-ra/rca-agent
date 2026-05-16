@@ -1,5 +1,6 @@
+import json
 from datetime import datetime
-from ...db import execute_one
+from ...db import execute_one, json_loads
 from ...models import ErrorLogEntry
 
 
@@ -8,17 +9,22 @@ class LocalDBAdapter:
         row = execute_one("SELECT * FROM error_logs WHERE id = %s", (error_id,))
         if not row:
             raise ValueError(f"Error log {error_id} not found")
+
+        # MySQL returns JSON columns as strings — parse them explicitly
+        stack_trace = json_loads(row["stack_trace"]) or []
+        metadata = json_loads(row.get("metadata")) or {}
+
         return ErrorLogEntry(
             id=str(row["id"]),
             service_name=row["service_name"],
             environment=row["environment"],
             error_type=row["error_type"],
             error_message=row["error_message"],
-            stack_trace=row["stack_trace"],
+            stack_trace=stack_trace,
             severity=row["severity"],
             occurred_at=row["occurred_at"],
             request_id=row.get("request_id"),
-            metadata=row.get("metadata") or {},
+            metadata=metadata,
         )
 
     def get_service_metadata(self, service_name: str) -> dict:

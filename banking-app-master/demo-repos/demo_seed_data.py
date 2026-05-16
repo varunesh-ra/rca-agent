@@ -2,7 +2,7 @@
 """
 demo_seed_data.py
 ─────────────────
-Inserts demo data into the rca_agent PostgreSQL database:
+Inserts demo data into the rca_db MySQL database:
   1. service_repo_map: payment-service and order-service
      (notification-service intentionally excluded — sub-agent will discover it)
   2. error_logs: 3 error logs matching the planted bugs
@@ -13,7 +13,7 @@ Usage:
 
 Env vars (fallback):
     GITHUB_ORG=oscorpAI
-    DATABASE_URL=postgresql://postgres:postgres@localhost:5432/rca_agent
+    DATABASE_URL=mysql+pymysql://root:root@localhost:3306/rca_db
 """
 import argparse
 import json
@@ -30,21 +30,33 @@ def main():
     parser.add_argument(
         "--db-url",
         default=os.environ.get(
-            "DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/rca_agent"
+            "DATABASE_URL", "mysql+pymysql://root:root@localhost:3306/rca_db"
         ),
     )
     args = parser.parse_args()
 
     try:
-        import psycopg2
-        import psycopg2.extras
+        import pymysql
+        import pymysql.cursors
     except ImportError:
-        print("ERROR: psycopg2 not installed. Run: pip install psycopg2-binary")
+        print("ERROR: PyMySQL not installed. Run: pip install PyMySQL")
         sys.exit(1)
 
-    conn = psycopg2.connect(args.db_url)
-    conn.autocommit = False
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    # Parse DSN
+    from urllib.parse import urlparse
+    raw = args.db_url.replace("mysql+pymysql://", "mysql://").replace("mysql+mysqldb://", "mysql://")
+    parsed = urlparse(raw)
+    conn = pymysql.connect(
+        host=parsed.hostname or "localhost",
+        port=parsed.port or 3306,
+        user=parsed.username or "root",
+        password=parsed.password or "",
+        database=parsed.path.lstrip("/"),
+        charset="utf8mb4",
+        cursorclass=pymysql.cursors.DictCursor,
+        autocommit=False,
+    )
+    cur = conn.cursor()
 
     # ── 1. service_repo_map ───────────────────────────────────────────────
     print("\n── Seeding service_repo_map ──")
@@ -57,17 +69,16 @@ def main():
         cur.execute(
             """INSERT INTO service_repo_map (service_name, github_org, github_repo, default_branch)
                VALUES (%s, %s, %s, %s)
-               ON CONFLICT (service_name) DO UPDATE
-               SET github_org=EXCLUDED.github_org,
-                   github_repo=EXCLUDED.github_repo,
-                   default_branch=EXCLUDED.default_branch""",
+               ON DUPLICATE KEY UPDATE
+                   github_org     = VALUES(github_org),
+                   github_repo    = VALUES(github_repo),
+                   default_branch = VALUES(default_branch)""",
             (svc, org, repo, branch),
         )
         print(f"  ✓ {svc} → github.com/{org}/{repo}")
 
     # ── 2. error_logs ─────────────────────────────────────────────────────
     print("\n── Seeding error_logs ──")
-    now = datetime.now(timezone.utc)
 
     error_logs = [
         # Case 1: payment-service AttributeError
@@ -149,13 +160,12 @@ def main():
 
     log_ids = []
     for log in error_logs:
+        # MySQL has no RETURNING — use INSERT IGNORE with pre-generated UUID
         cur.execute(
-            """INSERT INTO error_logs
+            """INSERT IGNORE INTO error_logs
                    (id, service_name, environment, error_type, error_message,
                     stack_trace, severity, occurred_at, metadata)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), %s)
-               ON CONFLICT (id) DO NOTHING
-               RETURNING id""",
+               VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), %s)""",
             (
                 log["id"],
                 log["service_name"],
@@ -176,7 +186,6 @@ def main():
 
     # ── 3. Write seeded_ids.json ───────────────────────────────────────────
     seeded_ids: dict[str, str] = {}
-    service_order = ["payment-service", "order-service", "notification-service"]
     for log_id, svc in log_ids:
         seeded_ids[svc] = log_id
 
@@ -194,12 +203,6 @@ def main():
         print(f"curl -s -X POST http://localhost:8000/rca/run \\")
         print(f'  -H "Content-Type: application/json" \\')
         print(f'  -d \'{{"error_log_id": "{log_id}"}}\' | python3 -m json.tool')
-        print()
-
-    print("── Poll results: ──\n")
-    for log_id, svc in log_ids:
-        print(f"# {svc}")
-        print(f"curl -s http://localhost:8000/rca/{log_id} | python3 -m json.tool")
         print()
 
 

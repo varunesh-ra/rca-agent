@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(mysql --version)",
+      "Bash(python *)",
+      "PowerShell(docker exec banking-app *)",
+      "PowerShell(docker exec rca-mysql *)"
+    ]
+  }
+}

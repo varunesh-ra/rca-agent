@@ -10,7 +10,7 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
 from rca_agent.config import settings
-from rca_agent.db import execute, execute_one
+from rca_agent.db import execute, execute_one, json_loads
 from rca_agent.adapters.observability.local_db import LocalDBAdapter
 from rca_agent.adapters.cicd.mock_adapter import MockCICDAdapter
 from rca_agent.agent import RCAAgent
@@ -146,7 +146,6 @@ def run_rca_stream(req: StreamRCARequest):
     )
 
 
-
 # ── HTML RCA Report ──────────────────────────────────────────────────────────
 
 @app.get("/rca/{error_log_id}/report", response_class=HTMLResponse)
@@ -163,8 +162,9 @@ def get_rca_report(error_log_id: str):
             content=f"<html><body><h2>RCA {row['rca_status']}</h2><p>No report available yet.</p></body></html>",
             status_code=202,
         )
-    from rca_agent.report_renderer import render_rca_html
-    return HTMLResponse(content=render_rca_html(row["rca_result"]))
+    # MySQL returns JSON columns as strings — parse before rendering
+    report_dict = json_loads(row["rca_result"])
+    return HTMLResponse(content=render_rca_html(report_dict))
 
 
 # ── Demo UI ──────────────────────────────────────────────────────────────────
@@ -180,20 +180,20 @@ def demo_ui():
 
 @app.get("/demo/scenarios")
 def demo_scenarios():
-    """Return pre-seeded error log IDs for the demo dropdown."""
-    ids_path = Path(__file__).parent.parent.parent / "demo-repos" / "seeded_ids.json"
-    if ids_path.exists():
-        import json as _json
-        return _json.loads(ids_path.read_text())
-    # Fall back to DB lookup
+    """Return all pending error log IDs for the demo dropdown."""
     rows = execute(
-        """SELECT service_name, id FROM error_logs
-           WHERE service_name IN ('payment-service','order-service','notification-service')
-           ORDER BY occurred_at DESC"""
+        """SELECT service_name, id, error_type, occurred_at
+           FROM error_logs
+           WHERE rca_status IN ('pending', 'failed')
+           ORDER BY occurred_at DESC
+           LIMIT 50"""
     )
-    result = {}
+    # Build label -> id map; label = "service — ErrorType (date)"
+    scenarios = {}
     for row in rows:
         svc = row["service_name"]
-        if svc not in result:
-            result[svc] = str(row["id"])
-    return result
+        err = row.get("error_type") or "UnknownError"
+        ts = str(row["occurred_at"])[:16]  # "2026-05-16 15:04"
+        label = f"{svc} — {err} ({ts})"
+        scenarios[label] = str(row["id"])
+    return {"scenarios": scenarios}

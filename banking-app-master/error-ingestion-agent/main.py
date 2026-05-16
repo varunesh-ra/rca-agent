@@ -11,7 +11,6 @@ import asyncio
 import logging
 import os
 import sys
-import time
 
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
@@ -30,10 +29,17 @@ logger = logging.getLogger("error-ingestion-agent")
 
 
 class LogFileHandler(FileSystemEventHandler):
-    """Watchdog handler that tails a log file for new error lines."""
+    """Watchdog handler that tails a log file for new error lines.
 
-    def __init__(self, log_path: str):
+    Watchdog calls on_modified from a background thread, so we hold a
+    reference to the main event loop and submit coroutines with
+    run_coroutine_threadsafe — the only safe way to schedule async work
+    from a non-async thread.
+    """
+
+    def __init__(self, log_path: str, loop: asyncio.AbstractEventLoop):
         self.log_path = log_path
+        self._loop = loop
         self._pos = self._get_file_size()
         self._buffer: list[str] = []
         logger.info("Watching log file: %s (starting at byte %d)", log_path, self._pos)
@@ -62,7 +68,6 @@ class LogFileHandler(FileSystemEventHandler):
             for line in new_content.splitlines():
                 if line.strip():
                     self._buffer.append(line)
-                    # Flush buffer on blank line or if line doesn't look like a stack frame
                     if not line.startswith("\t") and not line.startswith("    at "):
                         if len(self._buffer) > 1:
                             self._flush_buffer()
@@ -83,15 +88,16 @@ class LogFileHandler(FileSystemEventHandler):
         raw_log = "\n".join(self._buffer)
         self._buffer.clear()
         if is_error_line(raw_log):
-            asyncio.create_task(self._process(raw_log))
+            # Schedule the coroutine on the main async event loop from this thread
+            asyncio.run_coroutine_threadsafe(self._process(raw_log), self._loop)
 
     async def _process(self, raw_log: str):
         logger.info("Processing error log entry (%d chars)", len(raw_log))
         state = await process_log_entry(raw_log, source="db_watcher")
         if state.get("stored"):
-            logger.info("✓ Incident #%d stored", state["incident_id"])
+            logger.info("Incident %s stored", state["incident_id"])
         else:
-            logger.error("✗ Failed to store incident: %s", state.get("error"))
+            logger.error("Failed to store incident: %s", state.get("error"))
 
 
 async def run_file_watcher():
@@ -100,11 +106,16 @@ async def run_file_watcher():
 
     log_path = settings.log_file_path
     if not os.path.exists(log_path):
-        logger.warning("Log file not found: %s — creating empty file", log_path)
-        os.makedirs(os.path.dirname(log_path), exist_ok=True)
-        open(log_path, "w").close()
+        logger.warning("Log file not found: %s -- waiting for banking-app to create it...", log_path)
+        while not os.path.exists(log_path):
+            await asyncio.sleep(5)
+        logger.info("Log file appeared: %s", log_path)
 
-    handler = LogFileHandler(log_path)
+    # Capture the running loop and pass it to the handler so watchdog's
+    # background thread can submit coroutines safely.
+    loop = asyncio.get_running_loop()
+    handler = LogFileHandler(log_path, loop)
+
     observer = Observer()
     observer.schedule(handler, path=os.path.dirname(log_path) or ".", recursive=False)
     observer.start()
@@ -126,10 +137,10 @@ def main():
     elif settings.mode == "datadog":
         import uvicorn
         from datadog_webhook import app
-        logger.info("Starting Error Ingestion Agent in Datadog webhook mode on port %d", settings.webhook_port)
+        logger.info("Starting Datadog webhook mode on port %d", settings.webhook_port)
         uvicorn.run(app, host="0.0.0.0", port=settings.webhook_port)
     else:
-        logger.error("Unknown MODE: %s — must be 'db' or 'datadog'", settings.mode)
+        logger.error("Unknown MODE: %s -- must be 'db' or 'datadog'", settings.mode)
         sys.exit(1)
 
 

@@ -37,6 +37,15 @@ from .repo_resolver import RepoResolver
 
 logger = logging.getLogger(__name__)
 
+
+# ── Internal sentinel exception ───────────────────────────────────────────────
+
+class _FinishRCA(Exception):
+    """Raised by _dispatch when Claude calls finish_rca to exit the ReAct loop."""
+    def __init__(self, report: RCAReport):
+        self.report = report
+
+
 # ── System prompt ─────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """You are an expert Site Reliability Engineer performing automated Root Cause Analysis (RCA). You have access to tools to read source code from GitHub, inspect commit diffs, and query deployment history.
@@ -519,8 +528,8 @@ class RCAAgent:
             "iterations": iterations,
         })
 
-        # Persist
-        self._persist(final_report)
+        # Persist (best-effort — app/main.py also persists)
+        self._persist(final_report, error_log_id)
         return final_report
 
     # ── Tool dispatcher ───────────────────────────────────────────────────────
@@ -575,7 +584,6 @@ class RCAAgent:
         cache_hits: list[str],
         trace_callback: Callable[[dict], None] | None = None,
     ) -> dict:
-        svc = error_log.service_name
 
         if name == "get_repo_file":
             path = inp["path"]
@@ -588,7 +596,6 @@ class RCAAgent:
             if "error" not in result:
                 github_files_fetched.append(path)
             return result
-
 
         if name == "list_repo_files":
             return list_repo_files(
@@ -670,16 +677,21 @@ class RCAAgent:
             return {"status": "cached"}
 
         if name == "finish_rca":
-            inp.setdefault("schema_version", "1.0")
-            inp.setdefault("rca_id", str(uuid.uuid4()))
-            inp.setdefault("error_log_id", error_log.id)
-            inp.setdefault("service_name", error_log.service_name)
-            inp.setdefault("generated_at", datetime.now(timezone.utc).isoformat())
-            inp.setdefault("analysis_metadata", {})
-            inp["analysis_metadata"]["github_files_fetched"] = github_files_fetched
-            inp["analysis_metadata"]["cache_hits"] = cache_hits
-            inp["analysis_metadata"]["model"] = settings.model
-            return {"finish": True, "report_data": inp}
+            # Claude passes {"report": {<full report fields>}}
+            report_data = inp.get("report", inp)
+            report_data.setdefault("schema_version", "1.0")
+            report_data.setdefault("rca_id", str(uuid.uuid4()))
+            report_data.setdefault("error_log_id", error_log.id)
+            report_data.setdefault("service_name", error_log.service_name)
+            report_data.setdefault("generated_at", datetime.now(timezone.utc).isoformat())
+            report_data.setdefault("analysis_metadata", {})
+            report_data["analysis_metadata"]["github_files_fetched"] = github_files_fetched
+            report_data["analysis_metadata"]["cache_hits"] = cache_hits
+            report_data["analysis_metadata"]["model"] = settings.model
+            report_data["analysis_metadata"].setdefault("react_iterations", 0)
+            report_data["analysis_metadata"].setdefault("deployment_record_used", False)
+            report_data["analysis_metadata"].setdefault("repo_discovered_via", "unknown")
+            raise _FinishRCA(RCAReport(**report_data))
 
         logger.warning("Unknown tool: %s", name)
         return {"error": f"Unknown tool: {name}"}
