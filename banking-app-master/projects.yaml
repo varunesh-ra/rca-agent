@@ -1,0 +1,37 @@
+version: "1.0"
+
+# projects.yaml — RCA Agent pluggability config
+# Add new projects here to have rca-agent monitor them automatically.
+# No code changes required — rca-agent reads this file at startup.
+
+projects:
+  - id: banking-app
+    name: "Banking App"
+    description: "Spring Boot banking application with account management and transactions"
+    github_org: oscorpAI
+    github_repo: banking-app
+    environment: production
+    observability_mode: datadog    # 'datadog' | 'db'
+
+    datadog:
+      service_name: banking-app
+      env: production
+      monitor_ids: []              # populated after: terraform apply terraform/datadog_monitor.tf
+
+    # Public ALB endpoint for chaos scenario triggering from demo UI
+    chaos_endpoint: http://banking-app-alb.us-east-1.elb.amazonaws.com/chaos
+
+    # log_path is only used when observability_mode is 'db'
+    log_path: null
+
+  # Example: add a second service in db (file-watcher) mode
+  # - id: payments-service
+  #   name: "Payments Service"
+  #   description: "Internal payments processing microservice"
+  #   github_org: oscorpAI
+  #   github_repo: payments-service
+  #   environment: production
+  #   observability_mode: db
+  #   datadog: null
+  #   chaos_endpoint: null
+  #   log_path: /var/log/payments-service/app.log
